@@ -19,26 +19,42 @@ type HackernewsItem = {
   id : int
   title : string
   url : string option
+  score : int
 }
 
+[<RequireQualifiedAccess>]
+type Stories =
+    | New
+    | Top
+    | Best
+    | Job
+
 type State =
-    { StoryItems : Deferred<Result<HackernewsItem list, string>> }
+    { CurrentStories: Stories 
+      StoryItems : Deferred<Result<HackernewsItem list, string>> }
 
 type Msg =
+    | ChangeStories of Stories
     | LoadStoryItems of AsyncOperationStatus<Result<HackernewsItem list, string>>
 
 let init() =
-    let initialState = { StoryItems = HasNotStartedYet }
-    let initialCmd = Cmd.ofMsg (LoadStoryItems Started)
-    initialState, initialCmd
+    { CurrentStories = Stories.New
+      StoryItems = HasNotStartedYet }, Cmd.ofMsg (LoadStoryItems Started)
 
-let storiesEndpoint = "https://hacker-news.firebaseio.com/v0/topstories.json"
+let storiesEndpoint stories =
+  let fromBaseUrl = sprintf "https://hacker-news.firebaseio.com/v0/%sstories.json"
+  match stories with
+  | Stories.Best -> fromBaseUrl "best"
+  | Stories.Top -> fromBaseUrl "top"
+  | Stories.New -> fromBaseUrl "new"
+  | Stories.Job -> fromBaseUrl "job"
 
 let itemDecoder : Decoder<HackernewsItem> =
     Decode.object (fun fields -> {
         id = fields.Required.At [ "id" ] Decode.int
         title = fields.Required.At [ "title" ] Decode.string
         url = fields.Optional.At [ "url" ] Decode.string
+        score = fields.Required.At [ "score" ] Decode.int
     })
 
 let loadStoryItem (itemId: int) = async {
@@ -53,8 +69,9 @@ let loadStoryItem (itemId: int) = async {
       return None
 }
 
-let loadStoryItems = async {
-    let! (status, responseText) = Http.get storiesEndpoint
+let loadStoryItems stories = async {
+    let endpoint = storiesEndpoint stories
+    let! (status, responseText) = Http.get endpoint
     match status with
     | 200 ->
         // parse the response text as a list of IDs (integers)
@@ -83,9 +100,15 @@ let loadStoryItems = async {
 
 let update (msg: Msg) (state: State) : State * Cmd<Msg> =
     match msg with
+    | ChangeStories stories ->
+        let nextState = { state with StoryItems = InProgress; CurrentStories = stories }
+        let nextCmd = Cmd.fromAsync (loadStoryItems stories)
+        nextState, nextCmd
+
     | LoadStoryItems Started ->
         let nextState = { state with StoryItems = InProgress }
-        nextState, Cmd.fromAsync loadStoryItems
+        let nextCmd = Cmd.fromAsync (loadStoryItems state.CurrentStories)
+        nextState, nextCmd
 
     | LoadStoryItems (Finished (Ok storyItems)) ->
         let nextState = { state with StoryItems = Resolved (Ok storyItems) }
@@ -95,10 +118,49 @@ let update (msg: Msg) (state: State) : State * Cmd<Msg> =
         let nextState = { state with StoryItems = Resolved (Error error) }
         nextState, Cmd.none
 
+let storyCategories =
+  [ Stories.New
+    Stories.Top
+    Stories.Best
+    Stories.Job ]
+
+let storiesName = function
+  | Stories.New -> "New"
+  | Stories.Best -> "Best"
+  | Stories.Job -> "Job"
+  | Stories.Top -> "Top"
+
+let renderTabs selectedStories dispatch =
+  let switchStories stories =
+    if selectedStories <> stories
+    then dispatch (ChangeStories stories)
+
+  Html.div [
+    prop.className [ "tabs"; "is-toggle"; "is-fullwidth" ]
+    prop.children [
+      Html.ul [
+        for stories in storyCategories ->
+        Html.li [
+          prop.className [ if selectedStories = stories then "is-active" ]
+          prop.onClick (fun _ -> switchStories stories)
+          prop.children [
+            Html.a [ Html.span (storiesName stories) ]
+          ]
+        ]
+      ]
+    ]
+  ]
+
 let renderError (errorMsg: string) =
   Html.h1 [
     prop.style [ style.color.red ]
     prop.text errorMsg
+  ]
+
+let div (classes: string list) (children: ReactElement list) =
+  Html.div [
+    prop.className classes
+    prop.children children
   ]
   
 let renderItem item =
@@ -107,16 +169,34 @@ let renderItem item =
     prop.className "box"
     prop.style [ style.marginTop 15; style.marginBottom 15 ]
     prop.children [
-      match item.url with
-      | Some url ->
-        Html.a [
-          prop.style [ style.textDecoration.underline ]
-          prop.target.blank
-          prop.href url
-          prop.text item.title
+      div [ "columns"; "is-mobile" ] [
+        div [ "column"; "is-narrow" ] [
+          Html.div [
+            prop.className ["icon"]
+            prop.style [ style.marginLeft 20 ]
+            prop.children [
+              Html.i [ prop.className "fa fa-poll fa-2x"]
+              Html.span [
+                prop.style [ style.marginLeft 10; style.marginRight 10 ]
+                prop.text item.score
+              ]
+            ]
+          ]
         ]
-      | None ->
-        Html.p item.title
+
+        div [ "column"] [
+          match item.url with
+          | Some url ->
+            Html.a [
+              prop.style [ style.textDecoration.underline ]
+              prop.target.blank
+              prop.href url
+              prop.text item.title
+            ]
+          | None ->
+            Html.p item.title
+        ]
+      ]
     ]
   ]
 
@@ -145,6 +225,7 @@ let render (state: State) (dispatch: Msg -> unit) =
         prop.text "Elmish Hackernews"
       ]
 
+      renderTabs state.CurrentStories dispatch
       renderItems state.StoryItems
     ]
   ]
