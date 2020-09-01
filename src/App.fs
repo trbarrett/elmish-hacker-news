@@ -3,18 +3,8 @@ module App
 open Elmish
 open Elmish.React
 open Feliz
-
-module Cmd =
-    let fromAsync (operation: Async<'msg>) : Cmd<'msg> =
-        let delayedCmd (dispatch: 'msg -> unit) : unit =
-            let delayedDispatch = async {
-                let! msg = operation
-                dispatch msg
-            }
-
-            Async.StartImmediate delayedDispatch
-
-        Cmd.ofSub delayedCmd
+open Thoth.Json
+open Fable.SimpleHttp
 
 type AsyncOperationStatus<'t> =
     | Started
@@ -42,11 +32,54 @@ let init() =
     let initialCmd = Cmd.ofMsg (LoadStoryItems Started)
     initialState, initialCmd
 
-let loadStoryItems = async {
-  do! Async.Sleep 1500
-  let storyItems = [ { id = 1; title = "Example title"; url = None } ]
-  return LoadStoryItems (Finished (Ok storyItems))
+let storiesEndpoint = "https://hacker-news.firebaseio.com/v0/topstories.json"
+
+let itemDecoder : Decoder<HackernewsItem> =
+    Decode.object (fun fields -> {
+        id = fields.Required.At [ "id" ] Decode.int
+        title = fields.Required.At [ "title" ] Decode.string
+        url = fields.Optional.At [ "url" ] Decode.string
+    })
+
+let loadStoryItem (itemId: int) = async {
+    let endpoint = sprintf "https://hacker-news.firebaseio.com/v0/item/%d.json" itemId
+    let! (status, responseText) = Http.get endpoint
+    match status with
+    | 200 ->
+        match Decode.fromString itemDecoder responseText with
+        | Ok storyItem -> return Some storyItem
+        | Error _ -> return None
+    | _ ->
+      return None
 }
+
+let loadStoryItems = async {
+    let! (status, responseText) = Http.get storiesEndpoint
+    match status with
+    | 200 ->
+        // parse the response text as a list of IDs (integers)
+        let storyIds = Decode.fromString (Decode.list Decode.int) responseText
+        match storyIds with
+        | Ok storyIds ->
+            // take the first 10 IDs
+            // load the item from each ID in parallel
+            // aggregate the results into a single list
+            let! storyItems = 
+              storyIds
+              |> List.truncate 10
+              |> List.map loadStoryItem
+              |> Async.Parallel
+              |> Async.map (Array.choose id >> List.ofArray)
+
+            return LoadStoryItems (Finished (Ok storyItems))
+        | Error errorMsg ->
+            // could not parse the array of story ID's
+            return LoadStoryItems (Finished (Error errorMsg))
+    | _ ->
+        // non-OK response goes finishes with an error
+        return LoadStoryItems (Finished (Error responseText))
+}
+
 
 let update (msg: Msg) (state: State) : State * Cmd<Msg> =
     match msg with
