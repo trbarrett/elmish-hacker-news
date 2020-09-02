@@ -22,6 +22,10 @@ type HackernewsItem = {
   score : int
 }
 
+type DeferredResult<'t> = Deferred<Result<'t, string>>
+
+type DeferredStoryItem = DeferredResult<HackernewsItem>
+
 [<RequireQualifiedAccess>]
 type Stories =
     | New
@@ -31,11 +35,12 @@ type Stories =
 
 type State =
     { CurrentStories: Stories 
-      StoryItems : Deferred<Result<HackernewsItem list, string>> }
+      StoryItems : DeferredResult<Map<int, DeferredStoryItem>> }
 
 type Msg =
+    | LoadStoryItems of AsyncOperationStatus<Result<int list, string>>
+    | LoadedStoryItem of int * Result<HackernewsItem, string>
     | ChangeStories of Stories
-    | LoadStoryItems of AsyncOperationStatus<Result<HackernewsItem list, string>>
 
 let init() =
     { CurrentStories = Stories.New
@@ -57,16 +62,20 @@ let itemDecoder : Decoder<HackernewsItem> =
         score = fields.Required.At [ "score" ] Decode.int
     })
 
+let rnd = System.Random()
+
 let loadStoryItem (itemId: int) = async {
+    // simulate high network latency
+    do! Async.Sleep (rnd.Next(1000, 3000))
     let endpoint = sprintf "https://hacker-news.firebaseio.com/v0/item/%d.json" itemId
     let! (status, responseText) = Http.get endpoint
     match status with
     | 200 ->
         match Decode.fromString itemDecoder responseText with
-        | Ok storyItem -> return Some storyItem
-        | Error _ -> return None
+        | Ok storyItem -> return LoadedStoryItem (itemId, Ok storyItem)
+        | Error parseError -> return LoadedStoryItem (itemId, Error parseError)
     | _ ->
-      return None
+      return LoadedStoryItem (itemId, Error ("Http error while loading " + string id))
 }
 
 let loadStoryItems stories = async {
@@ -79,16 +88,8 @@ let loadStoryItems stories = async {
         match storyIds with
         | Ok storyIds ->
             // take the first 10 IDs
-            // load the item from each ID in parallel
-            // aggregate the results into a single list
-            let! storyItems = 
-              storyIds
-              |> List.truncate 10
-              |> List.map loadStoryItem
-              |> Async.Parallel
-              |> Async.map (Array.choose id >> List.ofArray)
-
-            return LoadStoryItems (Finished (Ok storyItems))
+            let firstTenStoryIds = storyIds |> List.truncate 10
+            return LoadStoryItems (Finished (Ok firstTenStoryIds))
         | Error errorMsg ->
             // could not parse the array of story ID's
             return LoadStoryItems (Finished (Error errorMsg))
@@ -110,13 +111,40 @@ let update (msg: Msg) (state: State) : State * Cmd<Msg> =
         let nextCmd = Cmd.fromAsync (loadStoryItems state.CurrentStories)
         nextState, nextCmd
 
-    | LoadStoryItems (Finished (Ok storyItems)) ->
-        let nextState = { state with StoryItems = Resolved (Ok storyItems) }
-        nextState, Cmd.none
+    | LoadStoryItems (Finished (Ok storyIds)) ->
+        let storiesMap = Map.ofList [ for id in storyIds -> id, Deferred.InProgress ]
+        let nextState = { state with StoryItems = Resolved (Ok storiesMap) }
+        nextState, Cmd.batch [ for id in storyIds -> Cmd.fromAsync (loadStoryItem id) ]
 
     | LoadStoryItems (Finished (Error error)) ->
         let nextState = { state with StoryItems = Resolved (Error error) }
         nextState, Cmd.none
+
+    | LoadedStoryItem (itemId, Ok item) ->
+      match state.StoryItems with
+      | Resolved (Ok storiesMap) ->
+        let modifiedStoriesMap =
+          storiesMap
+          |> Map.add itemId (Resolved (Ok item))
+
+        let nextState = { state with StoryItems = Resolved (Ok modifiedStoriesMap) }
+        nextState, Cmd.none
+
+      | _ ->
+        state, Cmd.none
+
+    | LoadedStoryItem (itemId, Error error) ->
+      match state.StoryItems with
+      | Resolved (Ok storiesMap) ->
+        let modifiedStoriesMap =
+          storiesMap
+          |> Map.add itemId (Resolved (Error error))
+
+        let nextState = { state with StoryItems = Resolved (Ok modifiedStoriesMap) }
+        nextState, Cmd.none
+
+      | _ ->
+        state, Cmd.none
 
 let storyCategories =
   [ Stories.New
@@ -130,23 +158,26 @@ let storiesName = function
   | Stories.Job -> "Job"
   | Stories.Top -> "Top"
 
-let renderTabs selectedStories dispatch =
+let renderTab currentStories stories dispatch =
   let switchStories stories =
-    if selectedStories <> stories
+    if currentStories <> stories
     then dispatch (ChangeStories stories)
 
+  Html.li [
+    prop.className [ currentStories = stories, "is-active" ]
+    prop.onClick (fun _ -> switchStories stories)
+    prop.children [
+      Html.a [ Html.span (storiesName stories) ]
+    ]
+  ]
+
+let renderTabs currentStories dispatch =
   Html.div [
     prop.className [ "tabs"; "is-toggle"; "is-fullwidth" ]
     prop.children [
       Html.ul [
-        for stories in storyCategories ->
-        Html.li [
-          prop.className [ if selectedStories = stories then "is-active" ]
-          prop.onClick (fun _ -> switchStories stories)
-          prop.children [
-            Html.a [ Html.span (storiesName stories) ]
-          ]
-        ]
+        for story in storyCategories ->
+          renderTab currentStories story dispatch
       ]
     ]
   ]
@@ -162,8 +193,19 @@ let div (classes: string list) (children: ReactElement list) =
     prop.className classes
     prop.children children
   ]
+
+let spinner =
+  Html.div [
+    prop.style [ style.textAlign.center; style.marginTop 20 ]
+    prop.children [
+      Html.i [
+        prop.className "fa fa-cog fa-spin fa-2x"
+      ]
+    ]
+  ]
+
   
-let renderItem item =
+let renderItemContent item =
   Html.div [
     prop.key item.id
     prop.className "box"
@@ -200,31 +242,43 @@ let renderItem item =
     ]
   ]
 
-let spinner =
+let renderStoryItem (itemId: int) storyItem =
+  let renderedItem =
+    match storyItem with
+    | HasNotStartedYet -> Html.none
+    | InProgress -> spinner
+    | Resolved (Error error) -> renderError error
+    | Resolved (Ok storyItem) -> renderItemContent storyItem
+
   Html.div [
-    prop.style [ style.textAlign.center; style.marginTop 20 ]
-    prop.children [
-      Html.i [
-        prop.className "fa fa-cog fa-spin fa-2x"
-      ]
-    ]
+    prop.key itemId
+    prop.className "box"
+    prop.style [ style.marginTop 15; style.marginBottom 15]
+    prop.children [ renderedItem ]
   ]
+
 
 let renderItems = function
   | HasNotStartedYet -> Html.none
   | InProgress -> spinner
   | Resolved (Error errorMsg) -> renderError errorMsg
-  | Resolved (Ok items) -> React.fragment [ for item in items -> renderItem item ]
+  | Resolved (Ok items) ->
+    items
+    |> Map.toList
+    |> List.map (fun (id, storyItem) -> renderStoryItem id storyItem)
+    |> Html.div
+
+let title =
+  Html.h1 [
+    prop.className "title"
+    prop.text "Elmish Hackernews"
+  ]
 
 let render (state: State) (dispatch: Msg -> unit) =
   Html.div [
     prop.style [ style.padding 20 ]
     prop.children [
-      Html.h1 [
-        prop.className "title"
-        prop.text "Elmish Hackernews"
-      ]
-
+      title
       renderTabs state.CurrentStories dispatch
       renderItems state.StoryItems
     ]
